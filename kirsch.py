@@ -99,7 +99,8 @@ for n, file in enumerate(args.img_files):
             name=os.path.splitext(file)[0], suff=args.img_suffix,
             ext=os.path.splitext(file)[1]))
     except IOError:
-        msg = 'Fatal Error: Could not write to file \'{name}\'.'.format(name=file)
+        msg = 'Fatal Error: Could not write to file ' \
+                '\'{name}\'.'.format(name=file)
         sys.exit(msg)
 
     print('')
