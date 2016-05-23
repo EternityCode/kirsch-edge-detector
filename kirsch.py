@@ -5,6 +5,10 @@ import os
 import sys
 from PIL import Image
 
+import numpy as np
+import pyopencl as cl
+import pyopencl.array as cl_array
+
 # Input Arguments
 def sposint(val):
     val = int(val)
@@ -19,8 +23,9 @@ aparser = argparse.ArgumentParser(
 aparser.add_argument('-s', '--suffix', dest='img_suffix', metavar='suffix',
     default='_edge', type=str,
     help='a string to append to the end of the input filename')
-aparser.add_argument('-a', '--accel-gpu', dest='accel_mode',
-    default=False, type=bool, help='enable GPU acceleration through OpenCL')
+aparser.add_argument('-a', '--accel-gpu', dest='accel_gpu', default=False,
+    action='store_true',
+    help='enable GPU acceleration through OpenCL')
 aparser.add_argument('-c', '--colour', dest='img_colour_map',
     choices=('mono', 'sim', 'fpga'), default='sim', type=str,
     help='select the output edge colour mapping, \'sim\' and \'fpga\' are ' \
@@ -70,40 +75,76 @@ def main():
             msg = 'Fatal Error: Could not open file ' \
                   '\'{name}\'.'.format(name=file)
             sys.exit(msg)
-    
-        img_edge = Image.new(
-            'RGB',
-            (img_grey.width * args.img_ratio, img_grey.height * args.img_ratio),
-            bg_colour)
-    
-        for y in range(1, img_grey.height - 1):
-            msg = '\r[{:0>3d}/{:0>3d}] Processing File: {} ' \
-                  '(Row {:0>5d} of {:0>5d})'
-            sys.stdout.write(
-                msg.format(n + 1, len(args.img_files),
-                            file, y + 1, img_grey.height - 1)
-            )
-            sys.stdout.flush()
-    
-            for x in range(1, img_grey.width - 1):
-                derivs = getDerivatives([img_grey.getpixel((x - 1, y - 1)),
-                                        img_grey.getpixel((x, y - 1)),
-                                        img_grey.getpixel((x + 1, y - 1)),
-                                        img_grey.getpixel((x + 1, y)),
-                                        img_grey.getpixel((x + 1, y + 1)),
-                                        img_grey.getpixel((x, y + 1)),
-                                        img_grey.getpixel((x - 1, y + 1)),
-                                        img_grey.getpixel((x - 1, y))])
-                if max(derivs) > args.threshold:
-                    pos = next(pos for pos in range(len(derivs))
-                                if derivs[pos] == max(derivs))
-                    for i_x in range(args.img_ratio):
-                        for i_y in range(args.img_ratio):
+
+        img_edge = Image.new('RGB',
+                (img_grey.width * args.img_ratio,
+                 img_grey.height * args.img_ratio),
+                bg_colour)
+        
+        if not(args.accel_gpu):            
+            for y in range(1, img_grey.height - 1):
+                msg = '\r[{:0>3d}/{:0>3d}] Processing File: {} ' \
+                    '(Row {:0>5d} of {:0>5d})'
+                sys.stdout.write(
+                    msg.format(n + 1, len(args.img_files),
+                        file, y + 1, img_grey.height - 1))
+                sys.stdout.flush()
+            
+                for x in range(1, img_grey.width - 1):
+                    derivs = getDerivatives([img_grey.getpixel((x - 1, y - 1)),
+                                            img_grey.getpixel((x, y - 1)),
+                                            img_grey.getpixel((x + 1, y - 1)),
+                                            img_grey.getpixel((x + 1, y)),
+                                            img_grey.getpixel((x + 1, y + 1)),
+                                            img_grey.getpixel((x, y + 1)),
+                                            img_grey.getpixel((x - 1, y + 1)),
+                                            img_grey.getpixel((x - 1, y))])
+                    if max(derivs) > args.threshold:
+                        pos = next(pos for pos in range(len(derivs))
+                                    if derivs[pos] == max(derivs))
+                        for i_x in range(args.img_ratio):
+                            for i_y in range(args.img_ratio):
+                                img_edge.putpixel(
+                                    (x * args.img_ratio + i_x,
+                                        y * args.img_ratio + i_y),
+                                    getEdgeColour(pos, args.img_colour_map))
+        else:
+            print('Warning: OpenCL Kirsch Operator Kernel is not implemented yet, ' \
+                  'this program will output white image.')
+            with open('kirsch_accel.cl', 'r') as cl_code_file:
+                cl_code = cl_code_file.read()
+            img_grey_arr = np.array(img_grey.getdata(), dtype=np.uint8)
+            colour_map = np.asarray(sim_colours, dtype=np.uint8)
+            img_edge_vec_arr = np.zeros(img_grey.height*img_grey.width,
+                dtype=cl_array.vec.uchar3)
+            cl_context = cl.create_some_context()
+            cl_queue = cl.CommandQueue(cl_context)
+            conv_table_buf = cl.Buffer(cl_context,
+                                       cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
+                                       hostbuf=img_grey_arr)
+            colour_map_buf = cl.Buffer(cl_context,
+                                       cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
+                                       hostbuf=colour_map)
+            img_edge_vec_buf = cl.Buffer(cl_context, cl.mem_flags.WRITE_ONLY, img_edge_vec_arr.nbytes)
+            cl_build = cl.Program(cl_context, cl_code).build()
+            launch = cl_build.kirsch_edges(cl_queue,
+                                           (img_grey.width, img_grey.height),
+                                           None,
+                                           conv_table_buf,
+                                           colour_map_buf,
+                                           img_edge_vec_buf)
+            launch.wait()
+            cl.enqueue_read_buffer(cl_queue, img_edge_vec_buf, img_edge_vec_arr).wait()
+            for i_y in range(img_grey.height):
+                for i_x in range(img_grey.width):
+                    for j_x in range(args.img_ratio):
+                        for j_y in range(args.img_ratio):
                             img_edge.putpixel(
-                                (x * args.img_ratio + i_x,
-                                    y * args.img_ratio + i_y),
-                                getEdgeColour(pos, args.img_colour_map))
-    
+                                (i_x*args.img_ratio + j_x, i_y*args.img_ratio + j_y),
+                                (img_edge_vec_arr[i_y*img_grey.width+i_x][0],
+                                 img_edge_vec_arr[i_y*img_grey.width+i_x][1],
+                                 img_edge_vec_arr[i_y*img_grey.width+i_x][2]))
+            
         try:
             img_edge.save('{name}{suff}{ext}'.format(
                 name=os.path.splitext(file)[0], suff=args.img_suffix,
