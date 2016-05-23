@@ -19,9 +19,8 @@ aparser = argparse.ArgumentParser(
 aparser.add_argument('-s', '--suffix', dest='img_suffix', metavar='suffix',
     default='_edge', type=str,
     help='a string to append to the end of the input filename')
-aparser.add_argument('-a', '--accel', dest='accel_mode',
-    choices=('mp', 'gpu'), default='mp', type=str,
-    help='enable acceleration by multi-threading \'mp\' or OpenCL \'gpu\'')
+aparser.add_argument('-a', '--accel-gpu', dest='accel_mode',
+    default=False, type=bool, help='enable GPU acceleration through OpenCL')
 aparser.add_argument('-c', '--colour', dest='img_colour_map',
     choices=('mono', 'sim', 'fpga'), default='sim', type=str,
     help='select the output edge colour mapping, \'sim\' and \'fpga\' are ' \
@@ -95,7 +94,7 @@ def main():
                                         img_grey.getpixel((x, y + 1)),
                                         img_grey.getpixel((x - 1, y + 1)),
                                         img_grey.getpixel((x - 1, y))])
-                if max(derivs) > args.deriv_threshold:
+                if max(derivs) > args.threshold:
                     pos = next(pos for pos in range(len(derivs))
                                 if derivs[pos] == max(derivs))
                     for i_x in range(args.img_ratio):
