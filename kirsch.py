@@ -19,25 +19,30 @@ aparser = argparse.ArgumentParser(
 aparser.add_argument('-s', '--suffix', dest='img_suffix', metavar='suffix',
     default='_edge', type=str,
     help='a string to append to the end of the input filename')
-aparser.add_argument('-t', '--threshold', dest='deriv_threshold',
-    metavar='threshold', default='383', type=int,
-    help='the maximum edge direction derivative threshold')
+aparser.add_argument('-a', '--accel', dest='accel_mode',
+    choices=('mp', 'gpu'), default='mp', type=str,
+    help='enable acceleration by multi-threading \'mp\' or OpenCL \'gpu\'')
 aparser.add_argument('-c', '--colour', dest='img_colour_map',
-    choices=('mono', 'sim', 'fpga'), default='sim',
+    choices=('mono', 'sim', 'fpga'), default='sim', type=str,
     help='select the output edge colour mapping, \'sim\' and \'fpga\' are ' \
-        'the ECE 327 colour mappings')
+        'the ECE 327 colour mappings (default: sim)')
+aparser.add_argument('-t', '--threshold', dest='threshold',
+    metavar='deriv_threshold', default='383', type=int,
+    help='the maximum edge direction derivative threshold (default: 383)')
 aparser.add_argument('-r', '--resize', dest='img_ratio', metavar='ratio',
-    default=1, type=sposint, help='scaling factor of each input pixel')
+    default=1, type=sposint,
+    help='scaling factor of each input pixel (default: 1)')
 aparser.add_argument('img_files', nargs='+', type=str)
+
 args = aparser.parse_args()
 
 # Colour Mappings
 bg_colour = (0, 0, 0)
 sim_colours = ((0, 100, 200), (100, 200, 0), (0, 200, 100), (255, 0, 0),
                 (0, 0, 255), (200, 100, 0), (0, 255, 0), (200, 0, 100))
-mono_colour = (255, 127, 0)
 fpga_colours = ((0, 0, 255), (255, 0, 0), (0, 255, 0), (255, 255, 0),
                 (85, 85, 85), (255, 0, 255), (0, 255, 255), (255, 255, 255))
+mono_colour = (255, 127, 0)
 
 # Function Definitions
 def getDerivatives(conv_table):
