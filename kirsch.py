@@ -3,18 +3,19 @@
 import argparse
 import os
 import sys
-from PIL import Image
+import time
+import math
 
-# import numpy as np
-# import pyopencl as cl
-# import pyopencl.array as cl_array
+import numpy as np
+from PIL import Image
+from scipy.signal import convolve2d
+import cupy as cp
 
 # Input Arguments
 def sposint(val):
     val = int(val)
     if val <= 0:
-        raise argparse.ArgumentTypeError(
-            '{} invalid positive int value'.format(val))
+        raise argparse.ArgumentTypeError(f'{val} invalid positive int value')
     return val
 
 aparser = argparse.ArgumentParser(
@@ -25,7 +26,7 @@ aparser.add_argument('-s', '--suffix', dest='img_suffix', metavar='suffix',
     help='a string to append to the end of the input filename')
 aparser.add_argument('-a', '--accel-gpu', dest='accel_gpu', default=False,
     action='store_true',
-    help='enable GPU acceleration through OpenCL')
+    help='enable GPGPU acceleration through CUDA')
 aparser.add_argument('-c', '--colour', dest='img_colour_map',
     choices=('mono', 'sim', 'fpga'), default='sim', type=str,
     help='select the output edge colour mapping, \'sim\' and \'fpga\' are ' \
@@ -40,121 +41,128 @@ aparser.add_argument('img_files', nargs='+', type=str)
 
 args = aparser.parse_args()
 
-# Colour Mappings
-bg_colour = (0, 0, 0)
-sim_colours = ((0, 100, 200), (100, 200, 0), (0, 200, 100), (255, 0, 0),
-                (0, 0, 255), (200, 100, 0), (0, 255, 0), (200, 0, 100))
-fpga_colours = ((0, 0, 255), (255, 0, 0), (0, 255, 0), (255, 255, 0),
-                (85, 85, 85), (255, 0, 255), (0, 255, 255), (255, 255, 255))
-mono_colour = (255, 127, 0)
+# Directional Colour Mappings
+bg_colour = np.array([0, 0, 0])
+cmaps = np.array([
+    # sim colours
+    [[0, 100, 200], [100, 200, 0], [0, 200, 100], [255, 0, 0],
+     [0, 0, 255], [200, 100, 0], [0, 255, 0], [200, 0, 100]],
+    # fpga colours
+    [[0, 0, 255], [255, 0, 0], [0, 255, 0], [255, 255, 0],
+     [85, 85, 85], [255, 0, 255], [0, 255, 255], [255, 255, 255]],
+    # mono colour
+    [[255, 127, 0], [255, 127, 0], [255, 127, 0], [255, 127, 0],
+      [255, 127, 0], [255, 127, 0], [255, 127, 0], [255, 127, 0]]
+    ])
 
 # Function Definitions
-def getDerivatives(conv_table):
-    conv_mask = [5, -3, -3, -3, -3, -3, 5, 5]
+def getKirschFilters():
+    kirsch = [5, -3, -3, -3, -3, -3, 5, 5]
     rot = lambda l, n: l[-n:] + l[:-n]
-    derivs = []
-    for _ in range(8):
-        derivs.append(sum([a * b for a, b in zip(conv_table, conv_mask)]))
-        conv_mask = rot(conv_mask, 1)
-    return derivs
-
-def getEdgeColour(index, colour_map):
-    if colour_map == 'sim':
-        return sim_colours[index]
-    elif colour_map == 'fpga':
-        return fpga_colours[index]
-    else:
-        return mono_colour
+    filts = np.zeros((8, 3, 3), dtype=np.int32)
+    for d in range(8):
+        filts[d] = np.array([kirsch[0:3],
+                             [kirsch[7], 0, kirsch[3]],
+                             kirsch[6:3:-1]], dtype=np.int32)
+        kirsch = rot(kirsch, 1)
+    return filts
 
 # Main Program
 def main():
-    for n, file in enumerate(args.img_files):
-        try:
-            img_grey = Image.open(args.img_files[0]).convert('L')
-        except IOError:
-            msg = 'Fatal Error: Could not open file ' \
-                  '\'{name}\'.'.format(name=file)
-            sys.exit(msg)
+    cmap = args.img_colour_map
+    cmap_idx = 0 if (cmap == 'sim') else (1 if (cmap == 'fpga') else 2)
+    thres = args.threshold
+    scale = args.img_ratio
+    filts = getKirschFilters()
 
-        img_edge = Image.new('RGB',
-                (img_grey.width * args.img_ratio,
-                 img_grey.height * args.img_ratio),
-                bg_colour)
-        
-        if not(args.accel_gpu):            
-            for y in range(1, img_grey.height - 1):
-                msg = '\r[{:0>3d}/{:0>3d}] Processing File: {} ' \
-                    '(Row {:0>5d} of {:0>5d})'
-                sys.stdout.write(
-                    msg.format(n + 1, len(args.img_files),
-                        file, y + 1, img_grey.height - 1))
-                sys.stdout.flush()
-            
-                for x in range(1, img_grey.width - 1):
-                    derivs = getDerivatives([img_grey.getpixel((x - 1, y - 1)),
-                                            img_grey.getpixel((x, y - 1)),
-                                            img_grey.getpixel((x + 1, y - 1)),
-                                            img_grey.getpixel((x + 1, y)),
-                                            img_grey.getpixel((x + 1, y + 1)),
-                                            img_grey.getpixel((x, y + 1)),
-                                            img_grey.getpixel((x - 1, y + 1)),
-                                            img_grey.getpixel((x - 1, y))])
-                    if max(derivs) > args.threshold:
-                        pos = next(pos for pos in range(len(derivs))
-                                    if derivs[pos] == max(derivs))
-                        for i_x in range(args.img_ratio):
-                            for i_y in range(args.img_ratio):
-                                img_edge.putpixel(
-                                    (x * args.img_ratio + i_x,
-                                        y * args.img_ratio + i_y),
-                                    getEdgeColour(pos, args.img_colour_map))
-        else:
-            print('Warning: OpenCL Kirsch Operator Kernel is not implemented yet.')
-            # with open('kirsch_accel.cl', 'r') as cl_code_file:
-            #     cl_code = cl_code_file.read()
-            # img_grey_arr = np.array(img_grey.getdata(), dtype=np.uint8)
-            # colour_map = np.asarray(sim_colours, dtype=np.uint8)
-            # img_edge_vec_arr = np.zeros(img_grey.height*img_grey.width,
-            #     dtype=cl_array.vec.uchar3)
-            # cl_context = cl.create_some_context()
-            # cl_queue = cl.CommandQueue(cl_context)
-            # conv_table_buf = cl.Buffer(cl_context,
-            #                            cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-            #                            hostbuf=img_grey_arr)
-            # colour_map_buf = cl.Buffer(cl_context,
-            #                            cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-            #                            hostbuf=colour_map)
-            # img_edge_vec_buf = cl.Buffer(cl_context, cl.mem_flags.WRITE_ONLY, img_edge_vec_arr.nbytes)
-            # cl_build = cl.Program(cl_context, cl_code).build()
-            # launch = cl_build.kirsch_edges(cl_queue,
-            #                                (img_grey.width, img_grey.height),
-            #                                None,
-            #                                conv_table_buf,
-            #                                colour_map_buf,
-            #                                img_edge_vec_buf)
-            # launch.wait()
-            # cl.enqueue_read_buffer(cl_queue, img_edge_vec_buf, img_edge_vec_arr).wait()
-            # for i_y in range(img_grey.height):
-            #     for i_x in range(img_grey.width):
-            #         for j_x in range(args.img_ratio):
-            #             for j_y in range(args.img_ratio):
-            #                 img_edge.putpixel(
-            #                     (i_x*args.img_ratio + j_x, i_y*args.img_ratio + j_y),
-            #                     (img_edge_vec_arr[i_y*img_grey.width+i_x][0],
-            #                      img_edge_vec_arr[i_y*img_grey.width+i_x][1],
-            #                      img_edge_vec_arr[i_y*img_grey.width+i_x][2]))
-            
+    for n, file in enumerate(args.img_files):
+        t0 = time.time_ns()
+
         try:
-            img_edge.save('{name}{suff}{ext}'.format(
-                name=os.path.splitext(file)[0], suff=args.img_suffix,
-                ext=os.path.splitext(file)[1]))
+            img_grey = np.asarray(Image.open(args.img_files[n]).convert('L'))
         except IOError:
-            msg = 'Fatal Error: Could not write to file ' \
-                    '\'{name}\'.'.format(name=file)
-            sys.exit(msg)
-    
+            sys.exit(f'Fatal Error: Could not open file {file}')
+
+        height, width = img_grey.shape
+
+        print(f'[File {n+1} of {len(args.img_files)}: ' \
+              f'{file} ({width}x{height})]')
+
+        if not(args.accel_gpu):
+            img_edge = np.zeros((height*scale, width*scale, 3), dtype=np.uint8)
+
+            # Compute directional derivative,
+            ct0 = time.time_ns()
+            derivs = np.zeros((8, height, width), dtype=np.int32)
+            for d in range(8):
+                filt = np.flipud(np.fliplr(filts[d]))
+                derivs[d] = convolve2d(img_grey, filt, mode='same',
+                                       boundary='symm')
+
+            # Threshold and max direction
+            max_derivs = np.max(derivs, axis=0)
+            max_dirs = np.argmax(derivs, axis=0)
+
+            for irow in range(height):
+                for icol in range(width):
+                    def getEdgePixel(dv, dr):
+                        return cmaps[cmap_idx][dr] if dv > thres else bg_colour
+                    pixVal = getEdgePixel(max_derivs[irow, icol],
+                                          max_dirs[irow, icol])
+                    for oy in range(scale):
+                        for ox in range(scale):
+                            orow = irow*scale + oy
+                            ocol = icol*scale + ox
+                            img_edge[orow][ocol] = pixVal
+
+            ct1 = time.time_ns()
+            print(f'CPU time: {(ct1-ct0)/1e6} ms')
+
+            img_edge = Image.fromarray(img_edge)
+
+        else:
+            d_img_grey = cp.asarray(img_grey, dtype=np.uint8)
+            d_img_edge = cp.asarray(np.zeros((height*scale, width*scale, 3),
+                                             dtype=np.uint8))
+
+            with open('kirsch.cu', 'r') as cu_src:
+                kirsch_mod = cp.RawModule(code=cu_src.read())
+
+            # Constants
+            pd_KF = kirsch_mod.get_global('KF')
+            d_KF = cp.ndarray(filts.shape, cp.int32, pd_KF)
+            d_KF[::] = cp.asarray(filts, cp.int32)
+
+            pd_CMAPS = kirsch_mod.get_global('CMAPS')
+            d_CMAPS = cp.ndarray(cmaps.shape, cp.uint32, pd_CMAPS)
+            d_CMAPS[::] = cp.asarray(cmaps, cp.uint32)
+
+            # Execute kernel
+            kirsch_filter = kirsch_mod.get_function('kirsch_filter')
+            kt0 = time.time_ns()
+            kirsch_filter((math.ceil(width/32), math.ceil(height/32)),
+                            (32,32,),
+                            (d_img_grey, d_img_edge, width, height,
+                            thres, cmap_idx, scale))
+            kt1 = time.time_ns()
+            print(f'CUDA Kernel time: {(kt1-kt0)/1e6} ms')
+
+            img_edge = Image.fromarray(cp.asnumpy(d_img_edge))
+
+        try:
+            ofile = f'{os.path.splitext(file)[0]}{args.img_suffix}' \
+                    f'{os.path.splitext(file)[1]}'
+            owidth, oheight = img_edge.size
+            img_edge.save(ofile)
+            print(f'Output: {ofile} ({owidth}x{oheight})')
+        except IOError:
+            sys.exit(f'Fatal Error: Could not write to file {file}')
+
+        t1 = time.time_ns()
+        print(f'Total file time: {(t1-t0)/1e6} ms')
+
         print('')
-    
+
     print('Success.')
 
 if __name__ == '__main__': main()
